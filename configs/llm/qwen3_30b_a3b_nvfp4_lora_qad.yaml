@@ -1,0 +1,73 @@
+# Qwen3-30B-A3B NVFP4 LoRA-QAD (MoE): attention linears + fused routed experts adapted with
+# rank-16 LoRA, frozen BF16 base shared with the teacher. Per-layer FSDP2 sharding is
+# mandatory here: root-only sharding all-gathers the 61 GB backbone on every rank (OOM).
+model:
+  model_path: Qwen/Qwen3-30B-A3B
+  attn_implementation: flash_attention_2
+
+data:
+  # Download (docs/data.md): hf download qatfactory/openperfectblend-100k-qwen3.5-9b-think \
+  #   --repo-type dataset --local-dir data   (or regenerate: configs/data/openperfectblend_100k_qwen3_5_9b.yaml)
+  train_eval_path: data/openperfectblend_100k_Qwen3.5-9B_think_train.jsonl
+  eval_size: 128
+  split_seed: 42
+  max_seq_len: 8192
+  cache_dir: cache/tokenized
+  num_proc: 16
+  truncate: true
+  chat_template_file: qatfactory/data/templates/qwen3_qad.jinja   # model_type qwen3_moe shares the Qwen3 chat format
+
+train:
+  output_dir: outputs/Qwen3-30B-A3B-nvfp4-lora-qad
+  num_train_epochs: 1
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 2
+  learning_rate: 1.0e-4
+  warmup_steps: 0.01
+  lr_scheduler_type: cosine
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  optim: adamw_torch
+  bf16: true
+  gradient_checkpointing: true
+  gradient_checkpointing_kwargs:
+    use_reentrant: false
+  eval_strategy: steps
+  eval_steps: 256
+  save_strategy: steps
+  save_steps: 1024
+  save_total_limit: 2
+  logging_steps: 8
+  dataloader_num_workers: 2
+  seed: 42
+  fsdp: full_shard auto_wrap
+  fsdp_config:
+    fsdp_version: 2
+    cpu_ram_efficient_loading: true   # rank 0 reads the 61 GB BF16 backbone; other ranks materialize only their shards
+    transformer_layer_cls_to_wrap:
+      - Qwen3MoeDecoderLayer
+
+qad:
+  temperature: 1.0
+  distill_weight: 1.0
+  hard_label_weight: 0.0
+  fused_runtime_scales: true
+  # The decoder layers are already gradient-checkpointed (train.gradient_checkpointing), so a
+  # nested per-expert checkpoint only adds a third expert forward per micro-step: 8x H100 A/B
+  # at seq 8192 gave 66 s/it (on) vs 40 s/it (off) with a 37 GiB peak when off.
+  expert_checkpointing: false
+  logits_chunk_size: 1024
+  metrics_top_k: [1, 5, 10]
+  metrics_logging_only: true
+  lora:
+    enable: true
+    rank: 16
+    alpha: 32
+    moe_hybrid_shared: true
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+wandb:
+  enable: false
+  project: qatfactory-qat
+  name: Qwen3-30B-A3B-NVFP4-LoRA-QAD

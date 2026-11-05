@@ -1,0 +1,35 @@
+# Tokenized dataset cache (repo-local, keyed by fingerprint)
+cache/
+
+# Training run outputs (HF checkpoints) and exported serving checkpoints
+outputs/
+exports/
+
+# Local datasets (conversation JSONL, incl. train_eval_path splits). Root-anchored: an
+# unanchored `data/` also swallows qatfactory/data/ and tests/data/, so new files there
+# never show up in `git status`.
+/data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Experiment tracking / logs
+wandb/
+*.log
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Per-run evaluation endpoint list (copy from endpoints.example.txt)
+/scripts/eval/quality/endpoints.txt

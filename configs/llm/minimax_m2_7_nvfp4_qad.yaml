@@ -1,0 +1,98 @@
+# MiniMax-M2.7 (MoE: 62 full-attention layers, 256 routed experts / top-8, ~229B total)
+# NVFP4 experts-only full-parameter quantization-aware distillation, weight-only (W4A16).
+#
+# Only the routed experts are fake-quantized and trained, matching the scope of the released
+# MiniMax NVFP4 checkpoints; attention, router, embeddings and lm_head stay frozen in BF16.
+#
+# Base model: MiniMax publishes FP8 weights only. Full-parameter QAD trains the expert
+# latents, so convert the snapshot to BF16 first:
+#   python scripts/dequant_fp8_minimax.py --source <MiniMaxAI/MiniMax-M2.7 snapshot> --output <bf16 dir>
+# and point model_path (and export --model-assets) at the BF16 copy.
+#
+# Data: one conversation JSONL of MiniMax-M2.7's own answers to Open Perfect Blend prompts,
+# built with scripts/generate_distill_dataset.py.
+#
+# Scale: the static state (BF16 latents + grads + 8-bit Adam + sharded teacher) needs two
+# 8xB200 nodes (16 ranks). cpu_ram_efficient_loading makes only the main rank read the
+# 457 GB checkpoint; the others build on meta and receive their shards by broadcast, and
+# QADTrainer applies the same to the teacher. Stage the model and the tokenized cache at the
+# same path on both nodes. Needs `pip install torchao`.
+#
+# Launch on each node (torchrun c10d rendezvous):
+#   torchrun --nnodes=2 --nproc_per_node=8 --rdzv_backend=c10d --rdzv_endpoint=<host>:29500 \
+#     scripts/train_llm_qat.py configs/llm/minimax_m2_7_nvfp4_qad.yaml
+
+model:
+  model_path: <path to the BF16 MiniMax-M2.7 copy>
+  attn_implementation: flash_attention_2
+
+data:
+  train_eval_path: data/openperfectblend_65536_MiniMax-M2.7_think_train.jsonl
+  eval_size: 256
+  split_seed: 42
+  max_seq_len: 8192
+  cache_dir: cache/tokenized   # pre-tokenize once and stage on every node
+  num_proc: 32
+  truncate: true
+
+train:
+  output_dir: outputs/MiniMax-M2.7-nvfp4-qad-experts-w4a16
+  num_train_epochs: 1
+  max_steps: 2000
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 1   # global batch 16 on 16 ranks
+  learning_rate: 1.0e-6
+  warmup_steps: 0.01
+  lr_scheduler_type: cosine
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  low_bit_optim: adamw8bit_sr
+  bf16: true
+  gradient_checkpointing: true
+  gradient_checkpointing_kwargs:
+    use_reentrant: false
+  eval_strategy: steps
+  eval_steps: 100
+  # Each checkpoint holds the BF16 weights (export input) and the per-rank FP32 latents and 8-bit
+  # optimizer state (resume input, same world size), about 1.4 TB in total.
+  save_strategy: steps
+  save_steps: 100
+  save_total_limit: 2
+  # Keep the optimizer in each checkpoint: the 8-bit optimizer state is saved per rank and a run of
+  # this size spans several jobs.
+  save_only_model: false
+  logging_steps: 10
+  dataloader_num_workers: 2
+  seed: 42
+  ddp_timeout: 5400   # the main rank reads the whole checkpoint while the others wait
+  fsdp: full_shard auto_wrap
+  fsdp_config:
+    fsdp_version: 2
+    # The FSDP options are built before the model loads (cpu_ram_efficient_loading needs
+    # them then), so the wrap class must be named here.
+    transformer_layer_cls_to_wrap: [MiniMaxM2DecoderLayer]
+    # Consolidate checkpoints on the main rank, so no shared filesystem across nodes is needed.
+    state_dict_type: FULL_STATE_DICT
+    cpu_ram_efficient_loading: true
+    sync_module_states: true
+
+qad:
+  temperature: 1.0
+  distill_weight: 1.0
+  hard_label_weight: 0.0
+  fused_runtime_scales: true
+  logits_chunk_size: 2048
+  master_fp32: false   # BF16 latents + stochastic rounding
+  teacher_cpu_offload: true   # frees ~27 GiB/GPU; without it step 2 OOMs on 2x8 B200
+  quantize_activations: false
+  target_modules: []   # experts only
+  moe:
+    routing_replay: mask   # anneals to free routing between 50% and 80% of training
+    replay_decay_start: 0.5
+    replay_decay_end: 0.8
+
+wandb:
+  enable: false
+  project: qatfactory-qat
+  name: MiniMax-M2.7-NVFP4-QAD-experts-W4A16

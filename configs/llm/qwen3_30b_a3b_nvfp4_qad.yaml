@@ -1,0 +1,92 @@
+# Qwen3-30B-A3B (MoE: 48 layers, 128 routed experts / top-8, no shared expert) NVFP4
+# full-parameter quantization-aware distillation, W4A4 training.
+#
+# Every attention projection and every routed expert (the fused 3D gate_up_proj / down_proj
+# tensors) is fake-quantized and trained; the router, embeddings, norms and lm_head stay
+# frozen in BF16. The teacher is a separate frozen copy, loaded only after the student is
+# sharded.
+#
+# Memory: an FP32 master plus FP32 Adam moments for 30B latents does not fit 8x80GB, so this
+# recipe keeps the latents in BF16 and uses torchao's 8-bit AdamW with BF16 stochastic
+# rounding (`low_bit_optim: adamw8bit_sr`), which keeps 1e-6 updates unbiased where
+# deterministic BF16 rounding would drop them. Needs `pip install torchao`.
+#
+# Data: one conversation JSONL of Qwen3-30B-A3B's own answers to Open Perfect Blend prompts,
+# built with scripts/generate_distill_dataset.py.
+#
+# Launch (1 node x 8 GPUs):
+#   PYTORCH_ALLOC_CONF=expandable_segments:True torchrun --nproc_per_node=8 \
+#     scripts/train_llm_qat.py configs/llm/qwen3_30b_a3b_nvfp4_qad.yaml
+# Smoke first: --train.max_steps 10 --data.max_seq_len 1024
+# Export: python scripts/export_nvfp4_vllm.py --source <output_dir> --model-assets Qwen/Qwen3-30B-A3B --output <dir>
+
+model:
+  model_path: Qwen/Qwen3-30B-A3B
+  attn_implementation: flash_attention_2
+
+data:
+  train_eval_path: data/openperfectblend_100k_Qwen3-30B-A3B_think_train.jsonl
+  eval_size: 128
+  split_seed: 42
+  max_seq_len: 8192
+  cache_dir: cache/tokenized
+  num_proc: 16
+  truncate: true
+
+train:
+  output_dir: outputs/Qwen3-30B-A3B-nvfp4-qad-w4a4
+  num_train_epochs: 1
+  max_steps: 2000       # the paper's run (training curves end at 2,000 steps); one epoch is ~5,900
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 2   # global batch 16 on 8 GPUs
+  learning_rate: 1.0e-6
+  warmup_steps: 0.01   # float < 1 = fraction of total steps
+  lr_scheduler_type: cosine
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  low_bit_optim: adamw8bit_sr
+  bf16: true
+  gradient_checkpointing: true
+  gradient_checkpointing_kwargs:
+    use_reentrant: false
+  eval_strategy: steps
+  eval_steps: 100
+  save_strategy: steps
+  save_steps: 64   # about an hour on 16 GB300 GPUs
+  save_total_limit: 2
+  # Rank 0 gathers the full FSDP state at every save; on a shared filesystem that can outlast the
+  # default 10-minute collective timeout.
+  ddp_timeout: 5400
+  logging_steps: 10
+  dataloader_num_workers: 2
+  seed: 42
+  fsdp: full_shard auto_wrap
+  fsdp_config:
+    fsdp_version: 2
+
+qad:
+  temperature: 1.0
+  distill_weight: 1.0
+  hard_label_weight: 0.0
+  fused_runtime_scales: true
+  logits_chunk_size: 2048
+  master_fp32: false   # BF16 latents + stochastic rounding (see header)
+  quantize_activations: true
+  # Attention projections. Routed experts are converted automatically for MoE models; the
+  # MLP suffixes only matter for architectures with dense or shared-expert MLPs.
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  moe:
+    quantize_shared_expert: true
+    # Teacher routing replay (R3-style): `mask` replays the teacher's expert choice while
+    # keeping the student's renormalized gates in the graph, `full` also replays the
+    # teacher's gate weights, `off` routes freely. Replay brought no consistent gain on this
+    # model, so the recipe trains with free routing.
+    routing_replay: off
+    replay_decay_start: 0.5
+    replay_decay_end: 0.8
+
+wandb:
+  enable: false
+  project: qatfactory-qat
+  name: Qwen3-30B-A3B-NVFP4-QAD-W4A4

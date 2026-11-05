@@ -1,0 +1,70 @@
+# On-policy QAD corpus: open-perfectblend prompts answered by DeepSeek-R1-Distill-Llama-8B.
+#
+# 100k deduplicated first-user turns sampled from `mlabonne/open-perfectblend` (ShareGPT
+# format; same pool, seed and dedup as the Qwen3.5-9B recipe, so the two corpora share their
+# prompts), each answered once by the model that is later frozen as the QAD teacher. Because
+# the responses come from that same checkpoint the corpus is ON-POLICY: the student trains
+# on sequences drawn from the teacher's own output distribution.
+#
+# Assistant turns carry `reasoning_content` as a separate field (from the server's
+# `--reasoning-parser deepseek_r1`); `qatfactory/data/templates/deepseek_r1_distill_qad.jinja`
+# renders it back into the supervised `<think>...</think>` turn at training time.
+#
+# Serve first (8x H100, one data-parallel replica per GPU):
+#   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 vllm serve deepseek-ai/DeepSeek-R1-Distill-Llama-8B --revision 6a6f4aa4197940add57724a7707d069478df56b1 \
+#     --served-model-name DeepSeek-R1-Distill-Llama-8B --data-parallel-size 8 \
+#     --reasoning-parser deepseek_r1 --max-model-len 16384 --port 8765
+#
+# Then generate (resumable; re-running skips completions already on disk):
+#   python scripts/generate_distill_dataset.py \
+#     configs/data/openperfectblend_100k_deepseek_r1_distill_llama_8b.yaml
+
+model:
+  model_path: deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+  revision: 6a6f4aa4197940add57724a7707d069478df56b1
+  # Prompts are rendered with the checkpoint's own SERVING template (it prefills `<think>\n`),
+  # which is what makes the samples on-policy. The training-side template is applied later.
+  chat_template_file: null
+  system_prompt: null
+  chat_template_kwargs: {}
+
+prompts:
+  dataset: mlabonne/open-perfectblend
+  revision: af60f3c18201652a83a93f46fcfee1b646ba3df7
+  split: train
+  conversation_field: conversations   # ShareGPT schema: {"from": ..., "value": ...} turns
+  role_key: from
+  content_key: value
+  user_roles: [human, user]
+  metadata_fields: [source]
+  num_samples: 100000
+  seed: 42
+  dedup: true
+  # Rendered-prompt cap; with sampling.max_tokens 8192 this is exactly the served
+  # max_model_len, so no request can be rejected for context overflow.
+  max_prompt_tokens: 8192
+
+sampling:
+  # Pure sampling (no top-p/top-k truncation): the corpus is drawn from the teacher's actual
+  # output distribution. R1-Distill's card recommends 0.6 for serving; for a recovery set
+  # the unmodified distribution is the point.
+  temperature: 1.0
+  top_p: 1.0
+  max_tokens: 8192
+  seed: 42        # per request, so prompts still diverge
+
+server:
+  base_url: http://127.0.0.1:8765/v1
+  model: DeepSeek-R1-Distill-Llama-8B
+  concurrency: 1024   # dense 8B: eight replicas sustain far more in-flight requests than a hybrid
+  timeout: 3600
+  write_batch_size: 512
+
+filter:
+  require_stop: true        # drop generations truncated at max_tokens
+  require_reasoning: true   # every assistant turn must carry a thinking trace
+  min_answer_chars: 1
+
+output:
+  path: data/openperfectblend_100k_DeepSeek-R1-Distill-Llama-8B_think_train.jsonl
+  shuffle_seed: 42

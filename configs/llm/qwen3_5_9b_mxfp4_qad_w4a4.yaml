@@ -1,0 +1,102 @@
+# Qwen3.5-9B MXFP4 W4A4 quantization-aware distillation.
+# Training is W4A4: weights are fake-quantized on the MXFP4 lattice (E2M1 block-32,
+# EVEN-rule E8M0 scales) AND every quantized linear's input activation is fake-quantized
+# with the serving-side rule (per-token block-32 E2M1, CEIL-rule E8M0 scales — the
+# flashinfer mxfp4_quantize cute-dsl semantics vLLM uses for native W4A4 on SM100+).
+# Activation quantization is fully dynamic (no calibration state), so the exported
+# checkpoint is byte-identical in schema to the weight-only recipe's and still serves
+# either W4A16 (Marlin) or W4A4 (FlashInfer); the difference is that training now
+# optimizes the deployed W4A4 numerics instead of the weight-only approximation.
+#
+# This file and qwen3_5_9b_mxfp4_qad.yaml differ ONLY in qad.quantize_activations
+# (plus train.output_dir / wandb.name).
+#
+# Launch (8 GPUs; override model/data paths for your layout):
+#   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 WANDB_MODE=online \
+#   torchrun --nproc_per_node=8 scripts/train_llm_qat.py \
+#     configs/llm/qwen3_5_9b_mxfp4_qad_w4a4.yaml
+
+model:
+  model_path: Qwen/Qwen3.5-9B   # Hub repo id (auto-downloaded) or a local directory
+  attn_implementation: flash_attention_2
+
+data:
+  # Single conversation JSONL of Qwen3.5-9B OpenPerfectBlend think data, tokenized once with
+  # the model's chat template (assistant-only loss mask; `<think>...</think>` embedded in the
+  # assistant content is rendered natively) and deterministically split into a disjoint
+  # train / held-out eval.
+  # Download (docs/data.md): hf download qatfactory/openperfectblend-100k-qwen3.5-9b-think \
+  #   --repo-type dataset --local-dir data   (or regenerate: configs/data/openperfectblend_100k_qwen3_5_9b.yaml)
+  train_eval_path: data/openperfectblend_100k_Qwen3.5-9B_think_train.jsonl
+  eval_size: 128          # held-out example count
+  split_seed: 42          # reproducible split
+  # Alternative: pre-split files (mutually exclusive with train_eval_path above).
+  # train_path: data/openperfectblend_100k_Qwen3.5-9B_think_train.jsonl
+  # eval_path: data/openperfectblend_100k_Qwen3.5-9B_think_eval.jsonl
+  max_seq_len: 8192
+  cache_dir: cache/tokenized   # repo-local, gitignored; reused across runs
+  num_proc: 16                 # parallel tokenization workers
+  truncate: true               # right-truncate over-length conversations
+  # chat_template_file: optional path to override the shipped generation-marked template
+
+train:
+  output_dir: outputs/Qwen3.5-9B-mxfp4-qad-w4a4-openperfectblend-100k-1epoch-lr1e-6
+  # Paper schedule, same as the NVFP4 recipe: one epoch, global batch 16, lr 1e-6.
+  num_train_epochs: 1          # one full pass; max_steps unset (-1) so epochs drive the schedule
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 2
+  learning_rate: 1.0e-6
+  warmup_steps: 0.01   # float < 1 = fraction of total steps (warmup_ratio was removed in transformers 5.1x)
+  lr_scheduler_type: cosine
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  optim: adamw_torch
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  bf16: true
+  gradient_checkpointing: true
+  gradient_checkpointing_kwargs:
+    use_reentrant: false
+  eval_strategy: steps
+  eval_steps: 100
+  save_strategy: steps
+  save_steps: 1000
+  logging_steps: 10
+  dataloader_num_workers: 2
+  seed: 42
+  fsdp: full_shard auto_wrap
+  fsdp_config:
+    fsdp_version: 2
+
+qad:
+  quant_format: mxfp4
+  temperature: 1.0
+  distill_weight: 1.0
+  hard_label_weight: 0.0
+  fused_runtime_scales: false
+  # W4A4: also fake-quantize input activations so training matches deployed W4A4
+  # numerics (vLLM quantizes activations to MXFP4 dynamically at serve on SM100+).
+  # Weight-only (false) trains W4A16 but can still be served W4A4 — a train/deploy
+  # mismatch on the activation term. The ONLY qad field that differs from
+  # qwen3_5_9b_mxfp4_qad.yaml.
+  quantize_activations: true
+  logits_chunk_size: 2048
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+    - in_proj_qkv
+    - in_proj_z
+    - in_proj_b
+    - in_proj_a
+    - out_proj
+
+wandb:
+  enable: true
+  project: qatfactory-qat
+  name: Qwen3.5-9B-MXFP4-QAD-W4A4-OpenPerfectBlend-100K-1Epoch-LR1e-6

@@ -1,0 +1,57 @@
+# On-policy QAD corpus: open-perfectblend prompts answered by Qwen3.5-9B — the corpus behind
+# every Qwen3.5-9B recipe in configs/llm/ (`data.train_eval_path`); the paper's corpus kept
+# 84,345 conversations after filtering. Sampling is stochastic, so a regenerated corpus has
+# the same recipe and size but not byte-identical responses.
+#
+# Serve first (8x H100, one data-parallel replica per GPU; Qwen3.5's delta-net layers carry
+# a large per-sequence recurrent state, so keep in-flight requests moderate):
+#   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 vllm serve Qwen/Qwen3.5-9B \
+#     --revision c202236235762e1c871ad0ccb60c8ee5ba337b9a \
+#     --served-model-name Qwen3.5-9B --data-parallel-size 8 \
+#     --reasoning-parser qwen3 --max-model-len 16384 --port 8765
+#
+# Then:
+#   python scripts/generate_distill_dataset.py configs/data/openperfectblend_100k_qwen3_5_9b.yaml
+
+model:
+  model_path: Qwen/Qwen3.5-9B
+  revision: c202236235762e1c871ad0ccb60c8ee5ba337b9a
+  chat_template_file: null   # serving template -> on-policy; the QAD template is applied by the trainer
+  system_prompt: null
+  chat_template_kwargs: {}
+
+prompts:
+  dataset: mlabonne/open-perfectblend
+  revision: af60f3c18201652a83a93f46fcfee1b646ba3df7
+  split: train
+  conversation_field: conversations
+  role_key: from
+  content_key: value
+  user_roles: [human, user]
+  metadata_fields: [source]
+  num_samples: 100000
+  seed: 42
+  dedup: true
+  max_prompt_tokens: 8192
+
+sampling:
+  temperature: 1.0
+  top_p: 1.0
+  max_tokens: 8192
+  seed: 42
+
+server:
+  base_url: http://127.0.0.1:8765/v1
+  model: Qwen3.5-9B
+  concurrency: 256
+  timeout: 3600
+  write_batch_size: 512
+
+filter:
+  require_stop: true
+  require_reasoning: true
+  min_answer_chars: 1
+
+output:
+  path: data/openperfectblend_100k_Qwen3.5-9B_think_train.jsonl
+  shuffle_seed: 42

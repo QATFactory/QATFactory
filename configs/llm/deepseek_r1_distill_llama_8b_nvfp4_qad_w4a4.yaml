@@ -1,0 +1,98 @@
+# DeepSeek-R1-Distill-Llama-8B NVFP4 weight-activation (W4A4) quantization-aware distillation.
+# FSDP2, bf16, global batch 16 (1 x grad-accum 2 x 8 GPUs, as in the paper),
+# cosine lr, one epoch; dense Llama-3 architecture (full-attention only, q/k/v/o +
+# gate/up/down, untied lm_head). Same recipe as deepseek_r1_distill_llama_8b_nvfp4_qad.yaml
+# (the W4A16 NVFP4 point of the format x activation grid); only the `qad` block differs.
+# NVFP4 W4A4 fake-quantizes every quantized linear's input with the serving-side rule (static
+# global scale from the training running max); the static input scales ride the fused-scale
+# machinery, so fused_runtime_scales must stay on.
+#
+# Launch (8 GPUs; keep the global batch at 16 on other counts via gradient_accumulation_steps):
+#   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 WANDB_MODE=online \
+#   torchrun --nproc_per_node=8 scripts/train_llm_qat.py \
+#     configs/llm/deepseek_r1_distill_llama_8b_nvfp4_qad_w4a4.yaml
+
+model:
+  # Bare Hub repo id: auto-downloaded to the default HF cache on first launch. A local
+  # directory works here too.
+  model_path: deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+  attn_implementation: flash_attention_2
+
+data:
+  # Single conversation JSONL, deterministically split into a disjoint train / held-out
+  # eval. Reasoning traces must survive into the assistant turn — either as a per-message
+  # `reasoning_content` field or as an inline `<think>...</think>` block in `content`; the
+  # template below renders both natively and supervises them.
+  #
+  # Built by scripts/generate_distill_dataset.py with
+  # configs/data/openperfectblend_100k_deepseek_r1_distill_llama_8b.yaml: Open Perfect Blend
+  # prompts answered by DeepSeek-R1-Distill-Llama-8B itself (on-policy for this student).
+  train_eval_path: data/openperfectblend_100k_DeepSeek-R1-Distill-Llama-8B_think_train.jsonl
+  eval_size: 128          # held-out example count
+  split_seed: 42          # reproducible split
+  # Alternative: pre-split files (mutually exclusive with train_eval_path above).
+  # train_path: data/..._train.jsonl
+  # eval_path: data/..._eval.jsonl
+  max_seq_len: 8192       # R1 traces are long; raise toward the 16384 model_max_length if VRAM allows
+  cache_dir: cache/tokenized   # repo-local, gitignored; reused across runs
+  num_proc: 16                 # parallel tokenization workers
+  truncate: true               # right-truncate over-length conversations
+  # Required: the distills report `model_type: llama` (shared with unrelated Llama-3
+  # backbones), so there is no auto-resolved shipped template for them.
+  chat_template_file: qatfactory/data/templates/deepseek_r1_distill_qad.jinja
+
+train:
+  output_dir: outputs/DeepSeek-R1-Distill-Llama-8B-nvfp4-qad-w4a4-openperfectblend-100k-1epoch-lr1e-6
+  num_train_epochs: 1          # one full pass; max_steps unset (-1) so epochs drive the schedule
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 2
+  learning_rate: 1.0e-6
+  warmup_steps: 0.01   # float < 1 = fraction of total steps (warmup_ratio was removed in transformers 5.1x)
+  lr_scheduler_type: cosine
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  optim: adamw_torch
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  bf16: true
+  gradient_checkpointing: true
+  gradient_checkpointing_kwargs:
+    use_reentrant: false
+  eval_strategy: steps
+  eval_steps: 100
+  save_strategy: steps       # a full run spans several jobs on most clusters; resume from the newest checkpoint
+  save_steps: 1024
+  save_total_limit: 2
+  logging_steps: 8
+  dataloader_num_workers: 2
+  seed: 42
+  fsdp: full_shard
+  fsdp_config:
+    fsdp_version: 2
+
+qad:
+  temperature: 1.0
+  distill_weight: 1.0
+  hard_label_weight: 0.0
+  fused_runtime_scales: true
+  quantize_activations: true   # W4A4: static-global-scale NVFP4 input fake-quant (needs fused_runtime_scales)
+  logits_chunk_size: 2048
+  # Teacher/student diagnostics logged under train/* and eval/* (fwd/rev KL, entropies,
+  # top-k agreement in both directions, and top-k set Jaccard index). Cheap (reuses the loss
+  # logits, no extra forward); train-side metrics are computed only on logging steps by default.
+  metrics_top_k: [1, 5, 10]
+  metrics_logging_only: true
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+wandb:
+  enable: true
+  project: qatfactory-qat
+  name: DeepSeek-R1-Distill-Llama-8B-NVFP4-QAD-W4A4-OpenPerfectBlend-100K-1Epoch-LR1e-6

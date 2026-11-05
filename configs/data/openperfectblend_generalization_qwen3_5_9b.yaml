@@ -1,0 +1,69 @@
+# Answered corpus for the generalization study (paper Finding 4): Open Perfect Blend prompts from
+# its four math and code sources, answered by Qwen3.5-9B in thinking mode with a 32K budget, so
+# that truncating at 4K vs 32K changes what is supervised. scripts/generalization/prepare_splits.py
+# then draws the balanced strata from it (docs/generalization.md).
+#
+# Every Open Perfect Blend row is answered once, without deduplicating prompts: UltraInteract has
+# only ~81K distinct instructions (24.5K of them Coding) spread over ~289K rows, so one answer per
+# distinct instruction cannot fill the 22.5K-row code/ui stratum (that would need 93% of answers to
+# end with `stop` past 4,096 tokens; a 10k-prompt pilot measured ~45%). Answering each row gives
+# every repeated instruction its own independent sample. The quotas cover each stratum's train +
+# eval rows at the pilot's eligibility rates: all Evol-CodeAlpaca and UltraInteract rows, plus 35K
+# MetaMathQA and 25K Orca-Math rows. About 440K generations in all.
+#
+# Serve first (one data-parallel replica per GPU; prompts up to 8K + answers up to 32K):
+#   vllm serve Qwen/Qwen3.5-9B --revision c202236235762e1c871ad0ccb60c8ee5ba337b9a \
+#     --served-model-name Qwen3.5-9B --data-parallel-size <num GPUs> \
+#     --reasoning-parser qwen3 --max-model-len 40960 --port 8765
+#
+# One node:
+#   python scripts/generate_distill_dataset.py configs/data/openperfectblend_generalization_qwen3_5_9b.yaml
+# Several nodes: build the pool once (--pool-only), run one generator per node with
+# --output.num_workers N --output.worker_index k against that node's server, then --merge-only.
+
+model:
+  model_path: Qwen/Qwen3.5-9B
+  revision: c202236235762e1c871ad0ccb60c8ee5ba337b9a
+  chat_template_file: null   # serving template -> on-policy
+  system_prompt: null
+  chat_template_kwargs: {}
+
+prompts:
+  dataset: mlabonne/open-perfectblend
+  revision: af60f3c18201652a83a93f46fcfee1b646ba3df7
+  split: train
+  conversation_field: conversations
+  role_key: from
+  content_key: value
+  user_roles: [human, user]
+  metadata_fields: [source]
+  source_quota:
+    meta-math/MetaMathQA: 35000
+    HuggingFaceH4/orca-math-word-problems-200k: 25000
+    theblackcat102/evol-codealpaca-v1: null
+    openbmb/UltraInteract_sft: null
+  seed: 42
+  dedup: false   # see above: repeated UltraInteract instructions are answered per row
+  max_prompt_tokens: 8192
+
+sampling:
+  temperature: 1.0
+  top_p: 1.0
+  max_tokens: 32768
+  seed: 42
+
+server:
+  base_url: http://127.0.0.1:8765/v1
+  model: Qwen3.5-9B
+  concurrency: 256
+  timeout: 7200
+  write_batch_size: 512
+
+filter:
+  require_stop: true
+  require_reasoning: true
+  min_answer_chars: 1
+
+output:
+  path: data/openperfectblend_generalization_Qwen3.5-9B_think_32k.jsonl
+  shuffle_seed: 42

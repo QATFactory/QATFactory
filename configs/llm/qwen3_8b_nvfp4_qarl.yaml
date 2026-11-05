@@ -1,0 +1,129 @@
+# Qwen3-8B NVFP4 quantization-aware reinforcement learning (GRPO on math, verifiable reward).
+#
+# The policy trains as NVFP4 fake-quantized latents under FSDP2 while a colocated vLLM
+# engine rolls out the *packed* NVFP4 export, so sampling happens at deployment numerics.
+# After every optimizer step the latents are re-packed and published into the live engine
+# (qatfactory/rl/vllm_nvfp4_sync.py).
+#
+# Launch (4x B200/H100):
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 PYTORCH_ALLOC_CONF=expandable_segments:True \
+#   torchrun --nproc_per_node=4 scripts/train_llm_qarl.py \
+#     configs/llm/qwen3_8b_nvfp4_qarl.yaml
+
+model:
+  # Latent (BF16) weights that actually train. A bare Hub repo id or a local directory —
+  # e.g. a QAD checkpoint, to continue quantization-aware training with a reward signal.
+  model_path: Qwen/Qwen3-8B-Base
+  # The compressed-tensors `nvfp4-pack-quantized` export vLLM serves for rollouts. Its
+  # frozen tensors must equal the latents' (checked at startup) and its per-module
+  # `input_global_scale`s become the run's pinned activation scales.
+  # examples/run_qarl_qwen3_8b.sh builds it: an RTN export of Qwen3-8B-Base
+  # (scripts/eval/rtn_export.sh) with activation scales calibrated on the Qwen3-8B corpus.
+  rollout_path: exports/RTN-Qwen3-8B-Base-nvfp4/vllm-nvfp4
+  attn_implementation: flash_attention_2
+
+data:
+  dataset: trl-lib/DeepMath-103K
+  train_split: train
+  eval_split: test
+  max_eval_samples: 256
+  # No prompt_suffix: the policy is trained on bare problems so it does not depend on
+  # instruction scaffolding at serve time. Note that accuracy_reward parses with
+  # try_extract_without_anchor=False, so it only scores completions that anchor their
+  # answer (\boxed{...} or "the answer is"); the model has to arrive at that habit itself.
+  # Watch reward and frac_reward_zero_std on the first steps -- an all-zero reward means
+  # no advantage variance and therefore no gradient at all.
+  # Names resolve against trl.rewards; `package.module:function` loads a custom reward.
+  reward_funcs:
+    - accuracy_reward
+
+train:
+  output_dir: outputs/Qwen3-8B-Base-nvfp4-qarl-deepmath
+  max_steps: 1024
+  # The generation batch (per_device * world * steps_per_generation, where
+  # steps_per_generation defaults to gradient_accumulation_steps) must be divisible by
+  # num_generations. Here 1 x 4 GPUs x 16 = 64 completions per optimizer step = 8 prompt
+  # groups. Accumulation also sets how many sequences each rollout engine decodes at once,
+  # and long completions are latency-bound, so a larger value buys data at little extra
+  # wall time.
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 16
+  num_generations: 8                  # group size for the GRPO advantage
+  max_completion_length: 8192
+  temperature: 1.0
+  top_p: 1.0
+  # Qwen3-8B-Base has not been trained to emit <think> itself, so the thinking protocol is
+  # one more thing RL would have to bootstrap. Disabling it makes the template prefill an
+  # empty <think></think>, and the model reasons in the visible answer instead.
+  chat_template_kwargs:
+    enable_thinking: false
+  beta: 0.0                           # no reference model / KL term
+  loss_type: dapo
+  learning_rate: 1.0e-6
+  warmup_steps: 0.02   # float < 1 = fraction of total steps (warmup_ratio was removed in transformers 5.1x)
+  lr_scheduler_type: constant_with_warmup
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  optim: adamw_torch
+  bf16: true
+  gradient_checkpointing: true
+  gradient_checkpointing_kwargs:
+    use_reentrant: false
+  # Crash insurance for a multi-day run: each checkpoint also keeps the optimizer state, so a
+  # resumed run continues it.
+  save_strategy: steps
+  save_steps: 128
+  save_total_limit: 1
+  save_only_model: false   # keep optimizer state so a resumed run continues it
+  logging_steps: 1
+  log_completions: true
+  num_completions_to_print: 2
+  dataloader_num_workers: 2
+  seed: 42
+  fsdp: full_shard auto_wrap
+  fsdp_config:
+    fsdp_version: 2
+  # Colocated rollout engine. `vllm_gpu_memory_utilization` is a fraction of TOTAL device
+  # memory, so keep it low when sharing GPUs with other jobs.
+  vllm_gpu_memory_utilization: 0.18   # ~33 GB of 183 GB
+  vllm_tensor_parallel_size: 1
+  vllm_max_model_length: 12288        # max_completion_length + prompt headroom
+  # Corrects the residual sampler/trainer gap and, just as usefully, measures it: watch
+  # `sampling/sampling_logp_difference/mean`, which stays small only if the NVFP4 weight
+  # sync and the shared tensor scales are correct.
+  vllm_importance_sampling_correction: true
+  # MUST be token-level for long completions. TRL's default ("sequence_mask") exponentiates
+  # the *sum* of per-token log-prob differences, so with ~7k-token completions and a
+  # per-token gap of ~0.07 nats the sequence ratio underflows to ~1e-25, the loss it
+  # multiplies collapses to denormals, and grad_norm becomes exactly 0 — training silently
+  # stops. Token-level ratios are exp(+/-0.07) ~ 1 and do not compound with length.
+  vllm_importance_sampling_mode: token_truncate
+  vllm_importance_sampling_clip_max: 2.0
+
+qad:
+  # false => weight-only (W4A16) training; true => also fake-quantize linear inputs (W4A4),
+  # matching how vLLM serves an export whose quantization_config declares input activations.
+  quantize_activations: false
+  # false => the rollout engine keeps the activation scales baked into the export for the
+  # whole run. true => the training forward tracks a running maximum over each linear's
+  # inputs and the publisher pushes it to vLLM, so activations are quantized against a
+  # scale measured on this model and this data. Watch
+  # `sampling/sampling_logp_difference/mean`: a better-fitted scale should shrink it.
+  sync_activation_scales: false
+  # Optimizer steps before the first scale publish. The running maximum only grows, so an
+  # early publish is not unsafe, just premature -- this lets the estimate settle instead of
+  # moving the rollout policy on every sync.
+  activation_scale_warmup_steps: 8
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+wandb:
+  enable: true
+  project: qatfactory-qarl
+  name: Qwen3-8B-Base-NVFP4-QARL-DeepMath

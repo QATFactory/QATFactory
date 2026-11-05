@@ -1,0 +1,28 @@
+{#-
+  QATFactory-patched Gemma 4 (unified) chat template for QAD supervision.
+
+  Gemma 4 renders a conversation as BOS followed by turns delimited with
+  `<|turn>{role}\n` ... `<turn|>\n`, and a model turn carries its reasoning inline as
+  `<|channel>thought\n{reasoning}<channel|>{answer}`. The training records already store the
+  full model turn (channel markers included) in the assistant `content`, so — unlike the
+  stock template, which *strips* thinking from prior turns — this template renders each
+  assistant turn verbatim and wraps it (from `<|turn>model\n` through the trailing
+  `<turn|>\n`) in `{% generation %}` ... `{% endgeneration %}`. That lets
+  `apply_chat_template(..., return_assistant_tokens_mask=True)` produce a token-level
+  assistant mask over the whole model turn for the QAD loss, matching the Qwen recipe.
+-#}
+{{- bos_token -}}
+{%- for message in messages -%}
+    {%- if message['role'] in ['system', 'developer'] -%}
+        {{- '<|turn>system\n' + (message['content'] | trim) + '<turn|>\n' -}}
+    {%- elif message['role'] == 'user' -%}
+        {{- '<|turn>user\n' + (message['content'] | trim) + '<turn|>\n' -}}
+    {%- elif message['role'] in ['assistant', 'model'] -%}
+        {%- generation %}
+        {{- '<|turn>model\n' + message['content'] + '<turn|>\n' -}}
+        {%- endgeneration %}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|turn>model\n' -}}
+{%- endif -%}

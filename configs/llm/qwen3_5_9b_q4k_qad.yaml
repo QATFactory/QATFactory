@@ -1,0 +1,97 @@
+# Qwen3.5-9B Q4_K (GGUF) weight-only quantization-aware distillation.
+# Same recovery recipe as the NVFP4 hybrid config (8x FSDP2, bf16, global batch 16 = 1 x
+# grad-accum 2 x 8 GPUs, cosine lr, one epoch), but the student's target linears are
+# fake-quantized on the llama.cpp Q4_K two-level lattice and the run exports to a GGUF
+# (targets losslessly Q4_K).
+#
+# Q4_K has no shared/fused runtime scales; fused_runtime_scales is off. The linear-attention
+# targets are GGUF-reordered on export (V-head grouped->tiled rows; out_proj column reorder);
+# the trainer packs deploy-layout blocks at save (q4k_weight.safetensors) and the exporter
+# splices them in unchanged, so the deployed model is lossless by construction.
+#
+# Launch (8x H100):
+#   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 WANDB_MODE=online \
+#   torchrun --nproc_per_node=8 scripts/train_llm_qat.py \
+#     configs/llm/qwen3_5_9b_q4k_qad.yaml
+
+model:
+  model_path: Qwen/Qwen3.5-9B   # Hub repo id (auto-downloaded) or a local directory
+  attn_implementation: flash_attention_2
+
+data:
+  # Single conversation JSONL of Qwen3.5-9B OpenPerfectBlend think data, tokenized once with
+  # the model's chat template (assistant-only loss mask; `<think>...</think>` embedded in the
+  # assistant content is rendered natively) and deterministically split into a disjoint
+  # train / held-out eval.
+  # Download (docs/data.md): hf download qatfactory/openperfectblend-100k-qwen3.5-9b-think \
+  #   --repo-type dataset --local-dir data   (or regenerate: configs/data/openperfectblend_100k_qwen3_5_9b.yaml)
+  train_eval_path: data/openperfectblend_100k_Qwen3.5-9B_think_train.jsonl
+  eval_size: 128          # held-out example count
+  split_seed: 42          # reproducible split
+  # Alternative: pre-split files (mutually exclusive with train_eval_path above).
+  # train_path: data/openperfectblend_100k_Qwen3.5-9B_think_train.jsonl
+  # eval_path: data/openperfectblend_100k_Qwen3.5-9B_think_eval.jsonl
+  max_seq_len: 8192
+  cache_dir: cache/tokenized
+  num_proc: 16
+  truncate: true
+
+train:
+  output_dir: outputs/Qwen3.5-9B-q4k-qad-openperfectblend-100k-1epoch-lr1e-6
+  num_train_epochs: 1          # one full pass; max_steps unset (-1) so epochs drive the schedule
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 2
+  learning_rate: 1.0e-6
+  warmup_steps: 0.01   # float < 1 = fraction of total steps (warmup_ratio was removed in transformers 5.1x)
+  lr_scheduler_type: cosine
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  optim: adamw_torch
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  bf16: true
+  gradient_checkpointing: true
+  gradient_checkpointing_kwargs:
+    use_reentrant: false
+  eval_strategy: steps
+  eval_steps: 256
+  save_strategy: steps
+  save_steps: 1024
+  logging_steps: 8
+  dataloader_num_workers: 2
+  seed: 42
+  fsdp: full_shard auto_wrap
+  fsdp_config:
+    fsdp_version: 2
+
+qad:
+  quant_format: q4_k
+  temperature: 1.0
+  distill_weight: 1.0
+  hard_label_weight: 0.0
+  fused_runtime_scales: false
+  logits_chunk_size: 2048
+  # Teacher/student diagnostics logged under train/* and eval/* (fwd/rev KL, entropies,
+  # top-k agreement in both directions, and top-k set Jaccard index). Cheap (reuses the loss
+  # logits, no extra forward); train-side metrics are computed only on logging steps by default.
+  metrics_top_k: [1, 5, 10]
+  metrics_logging_only: true
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+    - in_proj_qkv
+    - in_proj_z
+    - in_proj_b
+    - in_proj_a
+    - out_proj
+
+wandb:
+  enable: true
+  project: qatfactory-qat
+  name: Qwen3.5-9B-Q4_K-QAD-OpenPerfectBlend-100K-1Epoch-LR1e-6

@@ -1,0 +1,15 @@
+# Template endpoint set. Copy this file, edit the rows for your models, and pass
+# it to serve_endpoints.sh / run_all_endpoints.sh (or point $ENDPOINTS_FILE at
+# it). One model per line, pipe-separated; blank lines and '#' comments ignored.
+#
+# Columns:
+#   label              short slug -> output dir name (outputs/evalscope/<label>)
+#   gpu                CUDA device index the server binds to (one GPU per model)
+#   port               localhost port the vLLM OpenAI server listens on
+#   served_model_name  id returned by GET /v1/models (passed as --model to evalscope)
+#   model_path         HF checkpoint dir (local path or Hub repo id) to serve
+#   engine             optional: vllm (default) or sglang (see docs/sglang.md)
+#
+# label|gpu|port|served_model_name|model_path[|engine]
+my-quant-model|0|8001|My-Model-quant|checkpoints/My-Model-quant
+original-bf16|1|8002|My-Model|/path/to/My-Model-bf16

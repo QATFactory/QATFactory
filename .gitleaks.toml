@@ -1,0 +1,16 @@
+title = "QATFactory gitleaks config"
+
+[extend]
+useDefault = true
+
+# Hugging Face commit pins, e.g. DEFAULT_TOKENIZER_REVISION = "<40-hex sha>".
+[[allowlists]]
+description = "Hugging Face revision pins"
+regexTarget = "line"
+regexes = ['''^\s*[A-Z0-9_]*_REVISION\s*=\s*["'][0-9a-f]{40}["']\s*$''']
+
+# lm-eval task_hashes: RULER task names containing "key" map to SHA-256 config hashes.
+[[allowlists]]
+description = "lm-eval RULER task_hashes"
+regexTarget = "line"
+regexes = ['''^\s*"niah_multikey_\d+":\s*"[0-9a-f]{64}",?\s*$''']

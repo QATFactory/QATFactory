@@ -1,0 +1,57 @@
+# On-policy QAD corpus for configs/llm/minimax_m2_7_nvfp4_qad.yaml: 65,536 Open Perfect
+# Blend prompts (same pool, seed and dedup as the other recipes) answered by MiniMax-M2.7.
+#
+# MiniMax-M2.7 is released in FP8 only, so the responses are sampled from that release —
+# the same weights the QAD teacher is dequantized from. 4,000 steps at global batch 16 use
+# 64k conversations, one pass.
+#
+# Serve first (8x H100 or B200, tensor parallel; FP8 weights load natively):
+#   vllm serve MiniMaxAI/MiniMax-M2.7 --revision 0a6536713b0b03f3be97494e5cf8d22f668a3164 --served-model-name MiniMax-M2.7 \
+#     --tensor-parallel-size 8 --enable-expert-parallel \
+#     --reasoning-parser minimax_m2 --max-model-len 16384 --port 8765
+#
+# Then:
+#   python scripts/generate_distill_dataset.py configs/data/openperfectblend_65536_minimax_m2_7.yaml
+
+model:
+  model_path: MiniMaxAI/MiniMax-M2.7
+  revision: 0a6536713b0b03f3be97494e5cf8d22f668a3164
+  chat_template_file: null   # serving template -> on-policy; the QAD template is applied by the trainer
+  system_prompt: null
+  chat_template_kwargs: {}
+
+prompts:
+  dataset: mlabonne/open-perfectblend
+  revision: af60f3c18201652a83a93f46fcfee1b646ba3df7
+  split: train
+  conversation_field: conversations
+  role_key: from
+  content_key: value
+  user_roles: [human, user]
+  metadata_fields: [source]
+  num_samples: 65536
+  seed: 42
+  dedup: true
+  max_prompt_tokens: 8192
+
+sampling:
+  temperature: 1.0
+  top_p: 1.0
+  max_tokens: 8192
+  seed: 42
+
+server:
+  base_url: http://127.0.0.1:8765/v1
+  model: MiniMax-M2.7
+  concurrency: 256
+  timeout: 3600
+  write_batch_size: 512
+
+filter:
+  require_stop: true
+  require_reasoning: true
+  min_answer_chars: 1
+
+output:
+  path: data/openperfectblend_65536_MiniMax-M2.7_think_train.jsonl
+  shuffle_seed: 42
